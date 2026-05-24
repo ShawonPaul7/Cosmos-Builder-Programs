@@ -1,0 +1,1211 @@
+#!/usr/bin/env python3
+"""
+Cosmos Builders  —  Kart Dashboard v16
+Team F2405 | Hamtramck HS | Square One IVD
+Laptop demo mode — no hardware needed
+Keys: TAB=screens  SPACE/click=start/stop  R=reset  N=night  ESC=quit
+"""
+import pygame, sys, math, time, os
+from collections import deque
+from datetime import datetime
+
+# PDF export
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+    REPORTLAB_OK = True
+except ImportError:
+    REPORTLAB_OK = False
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+W, H = 800, 480
+FPS  = 30
+SPEED_WARN_MPH = 30.0
+# Save to 'exports' folder in the same directory as this script
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR  = os.path.join(BASE_DIR, "exports")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# ─── Color palette ────────────────────────────────────────────────────────────
+BG      = (3,   3,   7)
+BG2     = (8,   8,  14)
+PANEL   = (18,  18,  28)
+BORDER  = (45,  45,  65)
+AMBER   = (255, 140,  0)
+AMBER2  = (200, 100,  0)
+CYAN    = (0,   210, 255)
+RED     = (190,  10,  20)
+RED2    = (150,  20,  28)
+GRN     = (57,  255,  20)
+GRN2    = (30,  160,  10)
+WHT     = (240, 240, 250)
+GY1     = (180, 180, 195)
+GY2     = (100, 100, 120)
+GY3     = (45,   45,  65)
+GOLD    = (255, 200,  50)
+PRP     = (140,  80, 255)
+TEAL    = (0,   180, 150)
+OFF     = (25,   25,  38)
+BLU     = (75,  155, 255)   # ← fixed: defined at module level now
+
+def lerp_c(a, b, t):
+    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+def dim(c, f=0.45):
+    return tuple(int(v * f) for v in c)
+
+def glow(surf, cx, cy, r, color, alpha=60):
+    s = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
+    pygame.draw.circle(s, (*color, alpha), (r, r), r)
+    surf.blit(s, (cx - r, cy - r))
+
+def draw_panel(surf, x, y, w, h):
+    """Draws a smooth, premium panel with rounded corners and subtle depth."""
+    # Main panel with slightly rounded corners
+    pygame.draw.rect(surf, PANEL, (x, y, w, h), border_radius=12)
+
+    # Glass-like highlight surface
+    overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+    # Subtle top-down gradient highlight
+    for i in range(h // 2):
+        a = int(12 * (1 - i / (h // 2)))
+        pygame.draw.line(overlay, (255, 255, 255, a), (1, i), (w - 2, i))
+
+    # Inner border for a "beveled" or "inset" feel
+    pygame.draw.rect(overlay, (255, 255, 255, 6), (1, 1, w - 2, h - 2), 1, border_radius=11)
+    surf.blit(overlay, (x, y))
+
+    # Outer border (the main edge)
+    pygame.draw.rect(surf, BORDER, (x, y, w, h), 1, border_radius=12)
+
+def draw_background(surf):
+    """Fills the screen with a subtle vertical gradient for a smoother look."""
+    for i in range(H):
+        c = lerp_c(BG, BG2, i / H)
+        pygame.draw.line(surf, c, (0, i), (W, i))
+
+# ─── Shared state ─────────────────────────────────────────────────────────────
+ST = {
+    "spd": 0.0, "spd_mph": 0.0,
+    "df": 999, "db": 999,
+    "bpct": 80, "bv": 23.8, "ba": 8.2, "bmw": 0.0, "brange": 5.2,
+    "gl": 0.0, "gn": 0.0, "gl_max": 0.0, "gn_max": 0.0,
+    "tb": 32.0, "tm": 44.0,
+    "pw_hist":  deque(maxlen=60),
+    "spd_hist": deque(maxlen=60),
+    "running":    False,
+    "session_t0": None,
+    "session_start_str": "",   # human-readable start time
+    "trip_miles": 0.0,
+    "max_spd":    0.0,
+    "avg_spd":    0.0,
+    "spd_samples": 0,
+    "spd_sum":     0.0,
+    "g_hist":     deque(maxlen=15),
+    "gl_peak": 0.0, "gn_peak": 0.0,
+    "lap_n":    0, "lap_on": False,
+    "lap_t0":   0.0, "lap_cur": 0.0,
+    "lap_best": None, "laps": [],
+    "hot": False, "lobatt": False, "speedwarn": False,
+    "speed_limit": SPEED_WARN_MPH,
+    "pit_lane": False,
+    "total_wh": 0.0,
+    "last_log_t": 0.0,
+    "log_file": None,
+    "night":    False,
+    "tab":      0,
+    "reset_armed": False,
+    "reset_arm_t": 0.0,
+    "confirm_msg": "",
+    "msg_t": 0.0,
+    # Speed-warn event tracking
+    "speed_warn_count": 0,
+    "speed_warn_total_secs": 0.0,
+    "speed_warn_last_t": 0.0,
+    # Export state
+    "export_status": "",
+    "export_status_t": 0.0,
+}
+_dt = 0.0
+
+# ─── Demo simulation ──────────────────────────────────────────────────────────
+def demo_tick():
+    global _dt
+    _dt += 0.025
+    spd  = max(0, 45 + 35 * math.sin(_dt * 0.28))
+    mph  = spd * 0.621371
+    bpct = int(65 + 15 * math.sin(_dt * 0.04))
+    bv   = 22.5 + 1.8 * math.sin(_dt * 0.04)
+    ba   = (spd * 0.45) + abs(3.0 * math.sin(_dt * 0.19))
+
+    ST["spd"]    = spd
+    ST["spd_mph"]= mph
+    ST["df"]     = max(8, 160 + 130 * math.sin(_dt * 0.62))
+    ST["db"]     = max(8, 190 + 100 * math.sin(_dt * 0.51 + 2))
+    ST["bpct"]   = bpct
+    ST["bv"]     = round(bv, 2)
+    ST["ba"]     = round(ba, 2)
+    ST["bmw"]    = bv * ba * 1000
+    ST["brange"] = round(4.5 + 2 * math.sin(_dt * 0.03), 1)
+    ST["gl"]     = round(0.65 * math.sin(_dt * 1.1), 2)
+    ST["gn"]     = round(0.40 * math.sin(_dt * 0.7 + 1), 2)
+    ST["tb"]     = round(32 + 5 * math.sin(_dt * 0.05), 1)
+    ST["tm"]     = round(45 + 8 * math.sin(_dt * 0.04 + 0.5), 1)
+    ST["hot"]    = ST["tb"] > 60 or ST["tm"] > 60
+    ST["lobatt"] = bpct < 20
+
+    limit = 5.0 if ST["pit_lane"] else ST["speed_limit"]
+    was_warning = ST["speedwarn"]
+    ST["speedwarn"] = ST["running"] and mph > limit
+
+    # Track how long we spend over the limit
+    if ST["running"]:
+        if ST["speedwarn"]:
+            if not was_warning:
+                ST["speed_warn_count"] += 1
+                ST["speed_warn_last_t"] = time.time()
+            ST["speed_warn_total_secs"] += 0.025
+        if spd > ST["max_spd"]:
+            ST["max_spd"] = spd
+        ST["trip_miles"] += mph * (0.025 / 3600.0)
+        ST["total_wh"]   += (ST["bmw"] / 1000.0) * (0.025 / 3600.0)
+
+        # Rolling average speed
+        ST["spd_sum"]     += mph
+        ST["spd_samples"] += 1
+        ST["avg_spd"]      = ST["spd_sum"] / ST["spd_samples"]
+
+        # IVD Data Logger (CSV)
+        now_t = time.time()
+        if now_t - ST["last_log_t"] >= 1.0:
+            ST["last_log_t"] = now_t
+            if not ST["log_file"]:
+                ST["log_file"] = os.path.join(
+                    LOG_DIR, f"ivd_session_{int(now_t)}.csv")
+                with open(ST["log_file"], "w") as f:
+                    f.write("Time,Speed_MPH,Voltage_V,Current_A,"
+                            "Power_W,Batt_Temp_C,Motor_Temp_C,"
+                            "Total_Wh,Trip_Miles\n")
+            with open(ST["log_file"], "a") as f:
+                f.write(
+                    f"{datetime.now().strftime('%H:%M:%S')},"
+                    f"{mph:.1f},{bv:.2f},{ba:.2f},"
+                    f"{ST['bmw']/1000:.2f},{ST['tb']:.1f},{ST['tm']:.1f},"
+                    f"{ST['total_wh']:.2f},{ST['trip_miles']:.3f}\n")
+
+    if ST["lap_on"]:
+        ST["lap_cur"] = time.time() - ST["lap_t0"]
+
+    ST["pw_hist"].append(ST["bmw"] / 1000.0)
+    ST["spd_hist"].append(spd)
+
+    if ST["gl_max"] < abs(ST["gl"]): ST["gl_max"] = abs(ST["gl"])
+    if ST["gn_max"] < abs(ST["gn"]): ST["gn_max"] = abs(ST["gn"])
+
+    if ST["running"]:
+        ST["g_hist"].append((ST["gl"], ST["gn"]))
+        if abs(ST["gl"]) > abs(ST["gl_peak"]): ST["gl_peak"] = ST["gl"]
+        if abs(ST["gn"]) > abs(ST["gn_peak"]): ST["gn_peak"] = ST["gn"]
+
+# ─── Session helpers ──────────────────────────────────────────────────────────
+def toggle_start():
+    ST["running"] = not ST["running"]
+    if ST["running"]:
+        ST["session_t0"] = time.time()
+        ST["session_start_str"] = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+        ST["confirm_msg"] = "SESSION STARTED"
+    else:
+        ST["confirm_msg"] = "SESSION PAUSED"
+    ST["msg_t"] = time.time()
+
+def toggle_lap():
+    if not ST["running"]: return
+    now = time.time()
+    if not ST["lap_on"]:
+        ST["lap_on"] = True
+        ST["lap_t0"] = now
+        ST["lap_n"]  += 1
+    else:
+        e = now - ST["lap_t0"]
+        ST["laps"].append(e)
+        if ST["lap_best"] is None or e < ST["lap_best"]:
+            ST["lap_best"] = e
+        ST["lap_t0"]  = now
+        ST["lap_cur"] = e
+
+def do_reset():
+    ST["running"] = False
+    ST["session_t0"] = None
+    ST["session_start_str"] = ""
+    ST["trip_miles"] = 0.0
+    ST["max_spd"]    = 0.0
+    ST["avg_spd"]    = 0.0
+    ST["spd_sum"]    = 0.0
+    ST["spd_samples"]= 0
+    ST["lap_n"]  = 0
+    ST["lap_on"] = False
+    ST["lap_cur"] = 0.0
+    ST["lap_best"]= None
+    ST["laps"].clear()
+    ST["pw_hist"].clear()
+    ST["spd_hist"].clear()
+    ST["reset_armed"] = False
+    ST["gl_max"] = 0.0; ST["gn_max"] = 0.0
+    ST["total_wh"]  = 0.0
+    ST["log_file"]  = None
+    ST["g_hist"].clear()
+    ST["gl_peak"] = 0.0; ST["gn_peak"] = 0.0
+    ST["speed_warn_count"] = 0
+    ST["speed_warn_total_secs"] = 0.0
+    ST["confirm_msg"] = "SESSION RESET"
+    ST["msg_t"]       = time.time()
+
+def fmt_t(t):
+    m = int(t // 60)
+    s = t % 60
+    return f"{m}:{s:05.2f}"
+
+# ─── PDF Export ───────────────────────────────────────────────────────────────
+def export_pdf():
+    """Generate a professional session-summary PDF."""
+    if not REPORTLAB_OK:
+        ST["export_status"]   = "ERROR: Install reportlab  (pip install reportlab)"
+        ST["export_status_t"] = time.time()
+        return
+
+    # Compute derived numbers
+    elapsed = 0.0
+    if ST["session_t0"]:
+        elapsed = time.time() - ST["session_t0"]
+    elapsed_str = f"{int(elapsed//3600)}h {int((elapsed%3600)//60)}m {int(elapsed%60)}s"
+
+    avg_spd_mph = ST["avg_spd"]
+    max_spd_mph = ST["max_spd"] * 0.621371
+    trip_mi     = ST["trip_miles"]
+    trip_km     = trip_mi * 1.60934
+    eff         = ST["total_wh"] / trip_mi if trip_mi > 0.001 else 0.0
+    warn_mins   = ST["speed_warn_total_secs"] / 60.0
+    best_lap    = fmt_t(ST["lap_best"]) if ST["lap_best"] else "N/A"
+
+    # Lap table rows
+    lap_rows = [["Lap #", "Time", "vs Best"]]
+    for i, lt in enumerate(ST["laps"], 1):
+        diff = lt - ST["lap_best"] if ST["lap_best"] else 0.0
+        diff_str = f"+{diff:.2f}s" if diff > 0.001 else "BEST"
+        lap_rows.append([str(i), fmt_t(lt), diff_str])
+
+    # File path
+    fname  = f"kart_session_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    fpath  = os.path.join(LOG_DIR, fname)
+
+    doc    = SimpleDocTemplate(
+        fpath,
+        pagesize=letter,
+        leftMargin=0.75*inch,
+        rightMargin=0.75*inch,
+        topMargin=0.75*inch,
+        bottomMargin=0.75*inch,
+    )
+
+    styles = getSampleStyleSheet()
+
+    # Custom styles
+    title_style = ParagraphStyle(
+        "KartTitle",
+        parent=styles["Title"],
+        fontSize=26,
+        textColor=colors.HexColor("#00D2FF"),
+        spaceAfter=4,
+        alignment=TA_CENTER,
+    )
+    subtitle_style = ParagraphStyle(
+        "KartSub",
+        parent=styles["Normal"],
+        fontSize=11,
+        textColor=colors.HexColor("#B0B0C8"),
+        spaceAfter=2,
+        alignment=TA_CENTER,
+    )
+    section_style = ParagraphStyle(
+        "KartSection",
+        parent=styles["Heading2"],
+        fontSize=13,
+        textColor=colors.HexColor("#FFD700"),
+        spaceBefore=14,
+        spaceAfter=6,
+    )
+    footer_style = ParagraphStyle(
+        "KartFooter",
+        parent=styles["Normal"],
+        fontSize=8,
+        textColor=colors.HexColor("#606080"),
+        alignment=TA_CENTER,
+    )
+
+    # Styles for table cells to ensure they aren't black-on-black
+    label_style = ParagraphStyle(
+        "StatLabel",
+        parent=styles["Normal"],
+        fontSize=10,
+        textColor=colors.HexColor("#9090B0"),
+    )
+    value_style = ParagraphStyle(
+        "StatValue",
+        parent=styles["Normal"],
+        fontSize=10,
+        textColor=colors.HexColor("#E8E8F0"),
+        fontName="Helvetica-Bold",
+    )
+    lap_header_style = ParagraphStyle(
+        "LapHeader",
+        parent=styles["Normal"],
+        fontSize=10,
+        textColor=colors.HexColor("#00D2FF"),
+        fontName="Helvetica-Bold",
+        alignment=TA_CENTER,
+    )
+    lap_cell_style = ParagraphStyle(
+        "LapCell",
+        parent=styles["Normal"],
+        fontSize=10,
+        textColor=colors.HexColor("#D0D0E0"),
+        alignment=TA_CENTER,
+    )
+
+    def make_stat_table(rows):
+        """rows = [(label, value), ...]"""
+        data = [[Paragraph(f"<b>{l}</b>", label_style),
+                 Paragraph(str(v), value_style)] for l, v in rows]
+        t = Table(data, colWidths=[2.8*inch, 3.8*inch])
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0),  colors.HexColor("#0D0D1A")),
+            ("ROWBACKGROUNDS", (0, 0), (-1, -1),
+             [colors.HexColor("#0D0D1A"), colors.HexColor("#111122")]),
+            ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
+            ("ROWPADDING", (0, 0), (-1, -1), 6),
+            ("GRID",       (0, 0), (-1, -1), 0.4, colors.HexColor("#2A2A40")),
+        ]))
+        return t
+
+    def make_lap_table(rows):
+        data = []
+        for i, row in enumerate(rows):
+            s = lap_header_style if i == 0 else lap_cell_style
+            style_row = [Paragraph(str(c), s) for c in row]
+            data.append(style_row)
+        t = Table(data, colWidths=[1.2*inch, 2.0*inch, 2.0*inch])
+        ts = TableStyle([
+            ("BACKGROUND",  (0, 0), (-1, 0),  colors.HexColor("#1A1A30")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1),
+             [colors.HexColor("#0D0D1A"), colors.HexColor("#111122")]),
+            ("GRID",        (0, 0), (-1, -1), 0.4, colors.HexColor("#2A2A40")),
+            ("ROWPADDING",  (0, 0), (-1, -1), 6),
+            ("VALIGN",      (0, 0), (-1, -1), "MIDDLE"),
+        ])
+        # Highlight best lap green (using inline XML for paragraph)
+        for i, row in enumerate(rows[1:], 1):
+            if len(row) > 2 and row[2] == "BEST":
+                # We update the data for that cell to have green text
+                data[i][2] = Paragraph(f"<font color='#39FF14'><b>BEST</b></font>", lap_cell_style)
+        t.setStyle(ts)
+        return t
+
+    # ── Build story ───────────────────────────────────────────────────────
+    story = []
+
+    story.append(Paragraph("COSMOS BUILDERS", title_style))
+    story.append(Paragraph("Kart Dashboard v16  —  Session Report", subtitle_style))
+    story.append(Paragraph("Team F2405  |  Hamtramck HS  |  Square One IVD", subtitle_style))
+    story.append(Spacer(1, 0.15*inch))
+    story.append(HRFlowable(width="100%", thickness=1,
+                             color=colors.HexColor("#00D2FF"), spaceAfter=10))
+
+    # ── Session overview ──────────────────────────────────────────────────
+    story.append(Paragraph("SESSION OVERVIEW", section_style))
+    story.append(make_stat_table([
+        ("Session Started",        ST["session_start_str"] or "N/A"),
+        ("Export Generated",       datetime.now().strftime("%Y-%m-%d  %H:%M:%S")),
+        ("Total Session Duration", elapsed_str),
+        ("Laps Completed",         str(ST["lap_n"])),
+        ("Best Lap Time",          best_lap),
+        ("Data Log File",          os.path.basename(ST["log_file"]) if ST["log_file"] else "None"),
+    ]))
+
+    # ── Performance ───────────────────────────────────────────────────────
+    story.append(Paragraph("PERFORMANCE", section_style))
+    story.append(make_stat_table([
+        ("Top Speed",              f"{max_spd_mph:.1f} mph  /  {max_spd_mph*1.60934:.1f} km/h"),
+        ("Average Speed",          f"{avg_spd_mph:.1f} mph  /  {avg_spd_mph*1.60934:.1f} km/h"),
+        ("Total Distance",         f"{trip_mi:.4f} mi  /  {trip_km:.4f} km"),
+        ("Peak Lateral G",         f"{ST['gl_peak']:+.3f} G"),
+        ("Peak Longitudinal G",    f"{ST['gn_peak']:+.3f} G"),
+        ("Max Lateral G (abs)",    f"{ST['gl_max']:.3f} G"),
+        ("Max Longitudinal G (abs)",f"{ST['gn_max']:.3f} G"),
+    ]))
+
+    # ── Energy ────────────────────────────────────────────────────────────
+    story.append(Paragraph("ENERGY & BATTERY", section_style))
+    story.append(make_stat_table([
+        ("Total Energy Used",      f"{ST['total_wh']:.2f} Wh"),
+        ("Efficiency",             f"{eff:.1f} Wh/mi" if trip_mi > 0.001 else "N/A"),
+        ("Battery at Export",      f"{ST['bpct']}%"),
+        ("Voltage at Export",      f"{ST['bv']:.2f} V"),
+        ("Battery Temp",           f"{ST['tb']:.1f} °C"),
+        ("Motor Temp",             f"{ST['tm']:.1f} °C"),
+    ]))
+
+    # ── Safety events ─────────────────────────────────────────────────────
+    story.append(Paragraph("SAFETY EVENTS", section_style))
+    warn_pct = (ST["speed_warn_total_secs"] / elapsed * 100) if elapsed > 0 else 0.0
+    story.append(make_stat_table([
+        ("Speed Limit Set",        f"{ST['speed_limit']:.0f} mph"),
+        ("Pit Lane Mode Used",     "YES" if ST["pit_lane"] else "NO"),
+        ("Over-Limit Events",      str(ST["speed_warn_count"])),
+        ("Time Over Limit",        f"{warn_mins:.1f} min  ({warn_pct:.1f}% of session)"),
+        ("Low Battery Warnings",   "YES" if ST["bpct"] < 20 else "NO"),
+        ("Overheat Events",        "YES" if ST["hot"] else "NO"),
+    ]))
+
+    # ── Lap breakdown ─────────────────────────────────────────────────────
+    if len(ST["laps"]) > 0:
+        story.append(Paragraph("LAP BREAKDOWN", section_style))
+        story.append(make_lap_table(lap_rows))
+
+    # ── Footer ────────────────────────────────────────────────────────────
+    story.append(Spacer(1, 0.25*inch))
+    story.append(HRFlowable(width="100%", thickness=0.5,
+                             color=colors.HexColor("#2A2A40"), spaceAfter=6))
+    story.append(Paragraph(
+        f"Generated by Cosmos Builders Kart Dashboard v15  "
+        f"•  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  "
+        f"•  Hamtramck HHS  •  Team F2405",
+        footer_style,
+    ))
+
+    try:
+        doc.build(story)
+        ST["export_status"]   = f"✔ Saved:  {fpath}"
+        ST["export_status_t"] = time.time()
+    except Exception as exc:
+        ST["export_status"]   = f"Export ERROR: {exc}"
+        ST["export_status_t"] = time.time()
+
+# ─── Drawing helpers ──────────────────────────────────────────────────────────
+def T(surf, text, font, color, x, y, anchor="center"):
+    img = font.render(str(text), True, color)
+    r   = img.get_rect()
+    setattr(r, anchor, (x, y))
+    surf.blit(img, r)
+
+def arc_gauge(surf, cx, cy, R, frac, base_col, hi_col,
+              thick=8, start_deg=220, span_deg=280):
+    start = math.radians(start_deg)
+    span  = math.radians(span_deg)
+    end   = math.radians(start_deg + span_deg)
+    rect  = pygame.Rect(cx - R, cy - R, R * 2, R * 2)
+    pygame.draw.arc(surf, GY3, rect, start, end, thick + 2)
+    if frac > 0.01:
+        c = lerp_c(base_col, hi_col, frac)
+        pygame.draw.arc(surf, c, rect, start, start + span * frac, thick)
+        tip_a = start + span * frac
+        tx = int(cx + R * math.cos(tip_a))
+        ty = int(cy - R * math.sin(tip_a))
+        glow(surf, tx, ty, thick + 4, c, 80)
+
+def dist_c(d):
+    if d < 30:  return RED
+    if d < 80:  return (220, 130, 0)
+    if d < 160: return GOLD
+    return GRN
+
+def batt_c(p):
+    if p < 20: return RED
+    if p < 40: return AMBER
+    return GRN
+
+def temp_c(t):
+    if t > 60: return RED
+    if t > 50: return AMBER
+    return TEAL
+
+# ─── Screen draw functions ────────────────────────────────────────────────────
+def draw_header(surf, fonts, tab):
+    fh = fonts["sm"]
+    # Header background with subtle gradient
+    for i in range(32):
+        c = lerp_c((15, 15, 25), (8, 8, 14), i / 32)
+        pygame.draw.line(surf, c, (0, i), (W, i))
+    
+    tabs = ["DRIVE", "TELEMETRY", "G-FORCE", "SETTINGS"]
+    tw   = W // len(tabs)
+    for i, lbl in enumerate(tabs):
+        active = i == tab
+        if active:
+            # Active tab highlight
+            pygame.draw.rect(surf, (30, 30, 50), (i * tw, 0, tw, 32))
+            pygame.draw.line(surf, CYAN, (i * tw, 31), (i * tw + tw, 31), 2)
+            # Subtle glow for active tab
+            glow(surf, i * tw + tw // 2, 16, 25, CYAN, 40)
+        
+        col_tx = CYAN if active else GY2
+        T(surf, lbl, fh, col_tx, i * tw + tw // 2, 16)
+    pygame.draw.line(surf, BORDER, (0, 32), (W, 32), 1)
+
+def draw_status(surf, fonts):
+    fh = fonts["xs"]
+    # Status bar background with subtle gradient
+    for i in range(20):
+        c = lerp_c((8, 8, 14), (12, 12, 20), i / 20)
+        pygame.draw.line(surf, c, (0, H - 20 + i), (W, H - 20 + i))
+    
+    pygame.draw.line(surf, BORDER, (0, H - 20), (W, H - 20), 1)
+    run_c = GRN if ST["running"] else GY2
+    run_t = "● RUNNING" if ST["running"] else "○ STOPPED"
+    T(surf, run_t, fh, run_c, 8, H - 10, "midleft")
+    T(surf, "COSMOS BUILDERS  F2405  |  KART DASHBOARD v16", fh, GY2, W // 2, H - 10)
+    T(surf, time.strftime("%H:%M:%S"), fh, GY1, W - 6, H - 10, "midright")
+    # Toast
+    if time.time() - ST["msg_t"] < 2.5:
+        alpha = int(255 * min(1, (2.5 - (time.time() - ST["msg_t"])) / 0.5))
+        ms = pygame.Surface((W, 22), pygame.SRCALPHA)
+        ms.fill((0, 0, 0, 180))
+        surf.blit(ms, (0, H - 42))
+        img = fonts["sm"].render(ST["confirm_msg"], True, CYAN)
+        img.set_alpha(alpha)
+        surf.blit(img, img.get_rect(center=(W // 2, H - 31)))
+
+def draw_speed_gauge(surf, cx, cy, R, spd_mph, fonts):
+    MAX  = 80
+    frac = min(spd_mph, MAX) / MAX
+    col_arc = lerp_c(CYAN, RED, frac)
+    glow(surf, cx, cy, R + 14, col_arc, 25)
+    arc_gauge(surf, cx, cy, R, frac, CYAN, RED, thick=10)
+    for s in range(0, MAX + 1, 10):
+        a  = math.radians(220 + 280 * s / MAX)
+        ri = R - 16; ro = R - 6
+        xi = int(cx + ri * math.cos(a)); yi = int(cy - ri * math.sin(a))
+        xo = int(cx + ro * math.cos(a)); yo = int(cy - ro * math.sin(a))
+        pygame.draw.line(surf, GY2, (xi, yi), (xo, yo), 2 if s % 20 == 0 else 1)
+        if s % 20 == 0:
+            xt = int(cx + (R - 26) * math.cos(a))
+            yt = int(cy - (R - 26) * math.sin(a))
+            T(surf, str(s), fonts["xs"], GY1, xt, yt)
+    T(surf, f"{int(spd_mph)}", fonts["big"], WHT, cx, cy)
+    T(surf, "MPH", fonts["xs"], CYAN, cx, cy + 34)
+    T(surf, f"{int(spd_mph * 1.609)} km/h", fonts["xs"], GY2, cx, cy + 46)
+
+def draw_graph(surf, x, y, w, h, hist, label, col):
+    draw_panel(surf, x, y, w, h)
+    pts = list(hist)
+    for i in range(1, 4):
+        gy = y + (h * i // 4)
+        pygame.draw.line(surf, (25, 25, 35), (x + 10, gy), (x + w - 10, gy), 1)
+
+    MX = 1  # safe default
+    if len(pts) > 1:
+        MX = max(max(pts), 1)
+        coords = [
+            (x + 10 + i * (w - 20) / (len(pts) - 1),
+             y + h - 10 - (v / MX) * (h - 20))
+            for i, v in enumerate(pts)
+        ]
+        fill_pts = (
+            [(coords[-1][0], y + h - 10)]
+            + list(reversed(coords))
+            + [(coords[0][0], y + h - 10)]
+        )
+        s = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.polygon(s, (*col, 30),
+                            [(p[0] - x, p[1] - y) for p in fill_pts])
+        surf.blit(s, (x, y))
+        pygame.draw.lines(surf, col, False, coords, 2)
+        pygame.draw.circle(surf, col,
+                           (int(coords[-1][0]), int(coords[-1][1])), 3)
+        glow(surf, int(coords[-1][0]), int(coords[-1][1]), 6, col, 80)
+
+    T(surf, label,
+      pygame.font.SysFont("dejavusans", 10, bold=True), GY2,
+      x + 10, y + 10, "midleft")
+    if pts:
+        T(surf, f"{pts[-1]:.1f}",
+          pygame.font.SysFont("dejavusans", 14, bold=True), WHT,
+          x + w - 10, y + 15, "midright")
+        T(surf, f"MAX: {MX:.1f}",
+          pygame.font.SysFont("dejavusans", 8), GY3,
+          x + 10, y + h - 8, "midleft")
+
+def draw_start_button(surf, x, y, w, h, fonts):
+    running = ST["running"]
+    col_bg  = (15, 45, 15) if running else (45, 15, 15)
+    col_bd  = GRN if running else RED
+    col_tx  = GRN if running else RED
+    label   = "■  STOP SESSION" if running else "▶  START SESSION"
+    
+    # Button background with subtle vertical gradient
+    for i in range(h):
+        c = lerp_c(col_bg, dim(col_bg, 0.7), i / h)
+        pygame.draw.line(surf, c, (x + 8, y + i), (x + w - 8, y + i))
+    
+    pygame.draw.rect(surf, col_bd, (x, y, w, h), 2, border_radius=14)
+    glow(surf, x + w // 2, y + h // 2, h, col_bd, 35)
+    T(surf, label, fonts["med"], col_tx, x + w // 2, y + h // 2)
+
+def draw_reset_button(surf, x, y, w, h, fonts):
+    armed = ST["reset_armed"]
+    col_bg = (30, 15, 15) if armed else (35, 35, 45)
+    col_bd = RED if armed else GY2
+    label = "⚠ CONFIRM RESET?" if armed else "↺  RESET"
+    
+    # Button background with subtle vertical gradient
+    for i in range(h):
+        c = lerp_c(col_bg, dim(col_bg, 0.8), i / h)
+        pygame.draw.line(surf, c, (x + 6, y + i), (x + w - 6, y + i))
+        
+    pygame.draw.rect(surf, col_bd, (x, y, w, h), 1, border_radius=10)
+    T(surf, label, fonts["sm"], col_bd, x + w // 2, y + h // 2)
+
+# ─── DRIVE SCREEN ─────────────────────────────────────────────────────────────
+def screen_drive(surf, fonts, START_BTN, RESET_BTN):
+    TY  = 34
+    now = time.time()
+
+    SPD_CX, SPD_CY, SPD_R = W // 2, TY + 148, 130
+    draw_speed_gauge(surf, SPD_CX, SPD_CY, SPD_R, ST["spd_mph"], fonts)
+
+    BOX_Y = TY + 296
+    BOX_H = 68
+    eff_wh_mi = (ST["total_wh"] / ST["trip_miles"]
+                 if ST["trip_miles"] > 0.001 else 0.0)
+    boxes = [
+        (20,  280, "BATTERY",    f"{ST['bpct']}%",              batt_c(ST["bpct"])),
+        (320, 160, "EFFICIENCY", f"{eff_wh_mi:.1f} Wh/mi",     CYAN if eff_wh_mi < 150 else RED),
+        (500, 280, "TRIP",       f"{ST['trip_miles']:.3f} mi",  GOLD),
+    ]
+    for bx, bw, lbl, val, vc in boxes:
+        draw_panel(surf, bx, BOX_Y, bw, BOX_H)
+        T(surf, lbl, fonts["xs"], GY2,  bx + bw // 2, BOX_Y + 14)
+        T(surf, val, fonts["head"], vc, bx + bw // 2, BOX_Y + 40)
+
+    prox_y = BOX_Y + 52
+    df_c   = dist_c(ST["df"]); db_c = dist_c(ST["db"])
+    T(surf, f"▲{int(ST['df'])}cm", fonts["xs"], df_c, 400, prox_y)
+    T(surf, f"▼{int(ST['db'])}cm", fonts["xs"], db_c, 460, prox_y)
+
+    draw_start_button(surf, *START_BTN, fonts)
+    draw_reset_button(surf, *RESET_BTN, fonts)
+
+    if ST["running"] and ST["session_t0"]:
+        el = time.time() - ST["session_t0"]
+        T(surf, f"{int(el//60)}:{int(el%60):02d}",
+          fonts["sm"], GY1, 40, TY + 8, "midleft")
+
+    lap_c = GRN if ST["lap_on"] else GY2
+    T(surf,
+      f"LAP {ST['lap_n']}  {fmt_t(ST['lap_cur']) if ST['running'] else '--:--'}",
+      fonts["sm"], lap_c, W - 8, TY + 8, "midright")
+
+    # Pit lane banner
+    if ST["pit_lane"]:
+        al = int(60 + 40 * abs(math.sin(now * 10)))
+        ov = pygame.Surface((W, 24), pygame.SRCALPHA)
+        ov.fill((*GOLD, al))
+        surf.blit(ov, (0, TY + 24))
+        T(surf, "⚠ PIT LANE MODE ACTIVE — LIMIT 5 MPH",
+          fonts["sm"], BG, W // 2, TY + 36)
+
+    # ── OVER SPEED WARNING ────────────────────────────────────────────────
+    if ST["speedwarn"]:
+        _draw_speed_warning(surf, fonts, now)
+
+    # Low battery strip
+    if ST["lobatt"]:
+        al = int(60 + 40 * abs(math.sin(now * 5)))
+        ov = pygame.Surface((W, 24), pygame.SRCALPHA)
+        ov.fill((*RED, al))
+        surf.blit(ov, (0, TY))
+        T(surf, "⚠  LOW BATTERY", fonts["sm"], WHT, W // 2, TY + 12)
+
+    # Overheat strip
+    if ST["hot"] and not ST["speedwarn"]:
+        al = int(60 + 40 * abs(math.sin(now * 8)))
+        ov = pygame.Surface((W, 24), pygame.SRCALPHA)
+        ov.fill((*RED, al))
+        surf.blit(ov, (0, TY))
+        T(surf,
+          f"⚠  OVERHEAT  BATT:{ST['tb']:.0f}°C  MOTOR:{ST['tm']:.0f}°C",
+          fonts["sm"], WHT, W // 2, TY + 12)
+
+    # Session summary overlay
+    if not ST["running"] and ST["session_t0"] is not None:
+        _draw_session_summary(surf, fonts)
+
+def _draw_speed_warning(surf, fonts, now):
+    """
+    Full-screen OVER SPEED LIMIT warning — clean, clear, impossible to miss.
+    Shows a bold red sign with the current speed and the active limit.
+    """
+    limit = 5.0 if ST["pit_lane"] else ST["speed_limit"]
+    pulse = (math.sin(now * 4) + 1) / 2          # 0 → 1, slow pulse
+
+    # ── Semi-transparent red vignette ────────────────────────────────────
+    ov = pygame.Surface((W, H), pygame.SRCALPHA)
+    border_alpha = int(120 + 80 * pulse)
+    pygame.draw.rect(ov, (180, 0, 10, border_alpha), (0, 0, W, H), 18)
+    surf.blit(ov, (0, 0))
+
+    # ── Warning sign panel ───────────────────────────────────────────────
+    PW, PH = 480, 190
+    PX, PY = (W - PW) // 2, (H - PH) // 2 - 10
+
+    # Panel glow
+    glow(surf, W // 2, H // 2 - 10, 180, RED, int(30 + 20 * pulse))
+
+    # Panel background
+    panel_surf = pygame.Surface((PW, PH), pygame.SRCALPHA)
+    panel_surf.fill((25, 0, 0, 210))
+    surf.blit(panel_surf, (PX, PY))
+
+    # Red border (pulse thickness)
+    border_thick = 3 + int(pulse * 2)
+    pygame.draw.rect(surf, RED, (PX, PY, PW, PH), border_thick, border_radius=14)
+
+    # Bright inner border accent
+    pygame.draw.rect(surf, (255, 60, 60), (PX + 4, PY + 4, PW - 8, PH - 8),
+                     1, border_radius=10)
+
+    # ── Icon + main text ─────────────────────────────────────────────────
+    f_icon = pygame.font.SysFont("dejavusans", 36, bold=True)
+    f_main = pygame.font.SysFont("dejavusans", 42, bold=True)
+    f_sub  = pygame.font.SysFont("dejavusans", 20, bold=True)
+    f_spd  = pygame.font.SysFont("dejavusans", 32, bold=True)
+
+    CX = W // 2
+    CY = PY + PH // 2
+
+    # Warning triangle icon
+    icon_col = lerp_c(RED, GOLD, pulse)
+    T(surf, "⚠", f_icon, icon_col, CX, PY + 26)
+
+    # "OVER THE SPEED LIMIT" — the required label
+    T(surf, "OVER THE SPEED LIMIT", f_main, WHT, CX, CY - 10)
+
+    # Speed readout line
+    spd_col = lerp_c(WHT, RED, pulse)
+    T(surf,
+      f"{ST['spd_mph']:.0f} MPH  —  LIMIT: {limit:.0f} MPH",
+      f_spd, spd_col, CX, CY + 38)
+
+    # Subtle "SLOW DOWN" reminder at bottom of panel
+    T(surf, "REDUCE SPEED IMMEDIATELY", f_sub, AMBER, CX, PY + PH - 18)
+
+def _draw_session_summary(surf, fonts):
+    ov = pygame.Surface((W, H), pygame.SRCALPHA)
+    ov.fill((0, 0, 0, 180))
+    surf.blit(ov, (0, 0))
+    SW, SH = 400, 260
+    SX, SY = (W - SW) // 2, (H - SH) // 2
+    draw_panel(surf, SX, SY, SW, SH)
+    T(surf, "RIDE SUMMARY", fonts["head"], GOLD, W // 2, SY + 30)
+    el = time.time() - ST["session_t0"]
+    em, es = int(el // 60), int(el % 60)
+    eff = (ST["total_wh"] / ST["trip_miles"]
+           if ST["trip_miles"] > 0.001 else 0.0)
+    summary_stats = [
+        ("TOTAL DISTANCE", f"{ST['trip_miles']:.3f} miles", CYAN),
+        ("RIDE TIME",      f"{em}m {es}s",                  WHT),
+        ("TOP SPEED",      f"{ST['max_spd']*0.621371:.1f} mph", GOLD),
+        ("EFFICIENCY",     f"{eff:.1f} Wh/mi",
+         GRN if eff < 150 else AMBER),
+    ]
+    for i, (lbl, val, vc) in enumerate(summary_stats):
+        iy = SY + 75 + i * 40
+        T(surf, lbl, fonts["xs"], GY2, SX + 40, iy, "midleft")
+        T(surf, val, fonts["sm"], vc,  SX + SW - 40, iy, "midright")
+        pygame.draw.line(surf, GY3, (SX + 20, iy + 18), (SX + SW - 20, iy + 18), 1)
+    T(surf, "Press START to resume or RESET to clear",
+      fonts["xs"], GY1, W // 2, SY + SH - 25)
+
+# ─── TELEMETRY SCREEN ─────────────────────────────────────────────────────────
+def screen_telemetry(surf, fonts):
+    TY = 40
+    T(surf, "TELEMETRY", fonts["head"], GY1, W // 2, TY)
+    draw_graph(surf, 20, TY + 20, W - 40, 100, ST["pw_hist"], "POWER W", AMBER)
+    pygame.draw.line(surf, BORDER, (0, TY + 130), (W, TY + 130), 1)
+    draw_graph(surf, 20, TY + 140, W - 40, 90, ST["spd_hist"], "SPEED km/h", CYAN)
+    pygame.draw.line(surf, BORDER, (0, TY + 240), (W, TY + 240), 1)
+
+    rows = [
+        ("VOLTAGE",  f"{ST['bv']:.2f} V",       BLU),
+        ("CURRENT",  f"{ST['ba']:.2f} A",        AMBER),
+        ("POWER",    f"{ST['bmw']/1000:.2f} W",  CYAN),
+        ("RANGE",    f"{ST['brange']:.1f} mi",   GRN),
+        ("FRONT",    f"{int(ST['df'])} cm",      dist_c(ST["df"])),
+        ("REAR",     f"{int(ST['db'])} cm",      dist_c(ST["db"])),
+        ("BATT°C",   f"{ST['tb']:.1f}°C",        temp_c(ST["tb"])),
+        ("MOTOR°C",  f"{ST['tm']:.1f}°C",        temp_c(ST["tm"])),
+    ]
+    cw = (W - 40) // 4
+    for i, (lbl, val, vc) in enumerate(rows):
+        col_n = i % 4; row_n = i // 4
+        rx = 20 + col_n * cw
+        ry = TY + 250 + row_n * 55
+        draw_panel(surf, rx, ry, cw - 4, 48)
+        T(surf, lbl, fonts["xs"], GY2, rx + (cw - 4) // 2, ry + 12)
+        T(surf, val, fonts["sm"], vc,  rx + (cw - 4) // 2, ry + 30)
+
+# ─── G-FORCE SCREEN ───────────────────────────────────────────────────────────
+def screen_gforce(surf, fonts):
+    TY = 40
+    T(surf, "G-FORCE METER", fonts["head"], GY1, W // 2, TY)
+    T(surf, "(Connect MPU-6050 on Pi for live data — demo shown)",
+      fonts["xs"], GY2, W // 2, TY + 18)
+
+    GR = 170; cx = W // 3; cy = TY + 40 + GR
+    draw_panel(surf, cx - GR - 10, TY + 30, GR * 2 + 20, GR * 2 + 20)
+    for rr in [GR, GR * 2 // 3, GR // 3]:
+        pygame.draw.circle(surf, GY3, (cx, cy), rr, 1)
+    pygame.draw.line(surf, GY3, (cx - GR, cy), (cx + GR, cy), 1)
+    pygame.draw.line(surf, GY3, (cx, cy - GR), (cx, cy + GR), 1)
+
+    MG = 1.5
+    pts = list(ST["g_hist"])
+    if len(pts) > 1:
+        coords = [
+            (cx + int(GR * max(-1, min(1, lx / MG))),
+             cy - int(GR * max(-1, min(1, nx / MG))))
+            for lx, nx in pts
+        ]
+        pygame.draw.lines(surf, (0, 100, 150), False, coords, 2)
+
+    px = cx + int(GR * max(-1, min(1, ST["gl_peak"] / MG)))
+    py = cy - int(GR * max(-1, min(1, ST["gn_peak"] / MG)))
+    pygame.draw.circle(surf, GOLD, (px, py), 4)
+
+    dx = cx + int(GR * max(-1, min(1, ST["gl"] / MG)))
+    dy = cy - int(GR * max(-1, min(1, ST["gn"] / MG)))
+    glow(surf, dx, dy, 20, CYAN, 120)
+    pygame.draw.circle(surf, CYAN, (dx, dy), 8)
+    pygame.draw.line(surf, dim(CYAN, 0.5), (cx, cy), (dx, dy), 2)
+    T(surf, "← LAT →", fonts["xs"], GY2, cx, cy + GR + 12)
+    T(surf, "↑ LON ↓", fonts["xs"], GY2, cx, cy - GR - 12)
+
+    rx = W // 3 * 2 + 20; ry = TY + 40
+    draw_panel(surf, rx, ry, W - rx - 20, GR * 2 + 20)
+    items = [
+        ("LATERAL G",      f"{ST['gl']:+.3f}G",  CYAN),
+        ("LONGITUDINAL",   f"{ST['gn']:+.3f}G",  AMBER),
+        ("MAX LAT",        f"{ST['gl_max']:.3f}G", GOLD),
+        ("MAX LON",        f"{ST['gn_max']:.3f}G", GOLD),
+    ]
+    for i, (lbl, val, vc) in enumerate(items):
+        iy = ry + 20 + i * 78
+        T(surf, lbl, fonts["xs"], GY2, rx + (W - rx - 20) // 2, iy)
+        T(surf, val, fonts["head"], vc, rx + (W - rx - 20) // 2, iy + 30)
+        pygame.draw.line(surf, GY3, (rx + 10, iy + 55), (W - 30, iy + 55), 1)
+
+# ─── SETTINGS SCREEN ──────────────────────────────────────────────────────────
+def screen_settings(surf, fonts, START_BTN, RESET_BTN):
+    TY = 40
+
+    # ── Title ─────────────────────────────────────────────────────────────
+    T(surf, "SYSTEM SETTINGS", fonts["head"], GY1, W // 2, TY)
+
+    # ── Speed Limit panel ─────────────────────────────────────────────────
+    draw_panel(surf, 20, 56, 230, 106)
+    T(surf, "SPEED LIMIT WARNING", fonts["sm"], GY2, 135, 70)
+    T(surf, f"{ST['speed_limit']:.0f}", fonts["big"], CYAN, 135, 110)
+    T(surf, "MPH  ( ↑ / ↓ to adjust )", fonts["xs"], GY1, 135, 152)
+
+    # ── System info panel ─────────────────────────────────────────────────
+    draw_panel(surf, 260, 56, 520, 106)
+    T(surf, "SYSTEM INFORMATION", fonts["sm"], AMBER, 520, 70)
+    info = [
+        ("Dashboard",  "Kart Dashboard v16"),
+        ("Developer",  "Cosmos Builders"),
+        ("Hardware",   "RPi 5 + Square One IVD"),
+        ("Logging",    "ACTIVE" if ST["running"] else "READY"),
+        ("reportlab",  "✔ Installed" if REPORTLAB_OK
+                       else "✘ pip install reportlab"),
+    ]
+    for i, (k, v) in enumerate(info):
+        iy = 82 + i * 16
+        col_v = GRN if (k == "reportlab" and REPORTLAB_OK) else (
+            RED if k == "reportlab" else WHT)
+        T(surf, f"{k}:", fonts["xs"], GY2, 275, iy, "midleft")
+        T(surf, v,       fonts["xs"], col_v, 770, iy, "midright")
+
+    # ── Session stats snapshot ─────────────────────────────────────────────
+    draw_panel(surf, 20, 172, 370, 198)
+    T(surf, "CURRENT SESSION SNAPSHOT", fonts["sm"], TEAL, 205, 186)
+
+    elapsed = 0.0
+    if ST["session_t0"]:
+        elapsed = time.time() - ST["session_t0"]
+    em, es = int(elapsed // 60), int(elapsed % 60)
+    eff = (ST["total_wh"] / ST["trip_miles"]
+           if ST["trip_miles"] > 0.001 else 0.0)
+
+    snap_rows = [
+        ("Started",      ST["session_start_str"] or "Not started"),
+        ("Run time",     f"{em}m {es}s"),
+        ("Distance",     f"{ST['trip_miles']:.3f} mi"),
+        ("Top speed",    f"{ST['max_spd']*0.621371:.1f} mph"),
+        ("Avg speed",    f"{ST['avg_spd']:.1f} mph"),
+        ("Energy used",  f"{ST['total_wh']:.2f} Wh"),
+        ("Efficiency",   f"{eff:.1f} Wh/mi" if ST["trip_miles"] > 0.001 else "N/A"),
+        ("Laps done",    str(ST["lap_n"])),
+        ("Over-limit",   f"{ST['speed_warn_count']} events  "
+                         f"({ST['speed_warn_total_secs']:.0f}s)"),
+    ]
+    for i, (k, v) in enumerate(snap_rows):
+        iy = 206 + i * 18
+        T(surf, k + ":",  fonts["xs"], GY2, 32,  iy, "midleft")
+        T(surf, v,        fonts["xs"], WHT, 385, iy, "midright")
+
+    # ── PDF Export panel ──────────────────────────────────────────────────
+    EX = 400; EY = 172; EW = 380; EH = 198
+    draw_panel(surf, EX, EY, EW, EH)
+    T(surf, "EXPORT SESSION REPORT", fonts["sm"], GOLD, EX + EW // 2, EY + 16)
+
+    # Export button
+    btn_col  = GOLD if REPORTLAB_OK else GY3
+    btn_bg   = (30, 25, 0) if REPORTLAB_OK else (20, 20, 20)
+    BW, BH   = 240, 38
+    BX       = EX + (EW - BW) // 2
+    BY       = EY + 36
+    pygame.draw.rect(surf, btn_bg, (BX, BY, BW, BH), border_radius=10)
+    pygame.draw.rect(surf, btn_col, (BX, BY, BW, BH), 2, border_radius=10)
+    if REPORTLAB_OK:
+        glow(surf, BX + BW // 2, BY + BH // 2, BH + 10, GOLD, 30)
+    btn_label = "⬇  EXPORT TO PDF  [E]" if REPORTLAB_OK else "reportlab not installed"
+    T(surf, btn_label, fonts["sm"], btn_col, BX + BW // 2, BY + BH // 2)
+
+    # What is included note
+    note_lines = [
+        "Includes: session time, distances, top & avg speed,",
+        "energy use, efficiency, G-force peaks, safety events,",
+        "lap breakdown, and battery/thermal data.",
+        "",
+        f"Saved to:  ./exports/",
+    ]
+    for i, line in enumerate(note_lines):
+        T(surf, line, fonts["xs"], GY2, EX + EW // 2, EY + 88 + i * 16)
+
+    # Export status toast
+    if time.time() - ST["export_status_t"] < 6.0 and ST["export_status"]:
+        fade = min(1.0, (6.0 - (time.time() - ST["export_status_t"])) / 0.8)
+        col  = GRN if ST["export_status"].startswith("✔") else RED
+        img  = fonts["xs"].render(ST["export_status"], True, col)
+        img.set_alpha(int(255 * fade))
+        surf.blit(img, img.get_rect(center=(EX + EW // 2, EY + EH - 16)))
+
+    # ── Controls reminder ─────────────────────────────────────────────────
+    draw_panel(surf, 20, 378, 760, 60)
+    controls = [
+        ("SPACE", "Start / Stop"),
+        ("L",     "Lap"),
+        ("R×2",   "Reset"),
+        ("P",     "Pit lane"),
+        ("N",     "Night"),
+        ("E",     "Export PDF"),
+        ("1-4",   "Tabs"),
+        ("TAB",   "Next tab"),
+        ("ESC",   "Quit"),
+    ]
+    cw2 = 760 // len(controls)
+    for i, (key, desc) in enumerate(controls):
+        kx = 20 + i * cw2 + cw2 // 2
+        T(surf, key,  fonts["sm"], CYAN, kx, 396)
+        T(surf, desc, fonts["xs"], GY2,  kx, 414)
+
+# ─── Startup animation ────────────────────────────────────────────────────────
+def run_startup(screen, fonts):
+    clock  = pygame.time.Clock()
+    t0     = time.time()
+    TOTAL  = 5.8
+    CX     = W // 2
+    CY     = H // 2 - 20
+    R      = 68
+    START_A = math.radians(32)
+    END_A   = math.radians(328)
+    BRAND   = "COSMOS BUILDERS"
+    f_brand = pygame.font.SysFont("dejavusans", 22, bold=True)
+    f_tag   = pygame.font.SysFont("dejavusans", 11)
+
+    def glow_circle(surf, cx, cy, rr, col, alpha):
+        gs = pygame.Surface((rr * 2 + 2, rr * 2 + 2), pygame.SRCALPHA)
+        pygame.draw.circle(gs, (*col, alpha), (rr + 1, rr + 1), rr)
+        surf.blit(gs, (cx - rr - 1, cy - rr - 1))
+
+    def draw_C(surf, progress, brightness=1.0):
+        total   = END_A - START_A
+        draw_to = START_A + total * min(progress, 1.0)
+        rect    = pygame.Rect(CX - R, CY - R, R * 2, R * 2)
+        for thick, am in [(20, 0.03), (14, 0.09), (8, 0.25), (4, 0.55), (2, 1.00)]:
+            c  = lerp_c(GY2, WHT, am * brightness)
+            a1 = -draw_to; a2 = -START_A
+            if abs(a2 - a1) > 0.02:
+                pygame.draw.arc(surf, c, rect, a1, a2, thick)
+        if 0.01 < progress < 1.02:
+            dx = int(CX + R * math.cos(-draw_to))
+            dy = int(CY + R * math.sin(-draw_to))
+            for rr, aa in [(18, 15), (12, 45), (7, 100), (4, 210)]:
+                glow_circle(surf, dx, dy, rr, WHT, aa)
+
+    def draw_brand(surf, progress):
+        n_chars       = len(BRAND)
+        chars_to_show = min(n_chars, int(progress * (n_chars + 2)))
+        displayed     = BRAND[:chars_to_show]
+        full_w        = f_brand.size(BRAND)[0]
+        x_start       = CX - full_w // 2
+        x             = x_start
+        for i, ch in enumerate(displayed):
+            char_age = progress * (n_chars + 2) - i
+            alpha    = min(255, int(char_age * 180))
+            ci       = f_brand.render(ch, True, WHT)
+            ci.set_alpha(alpha)
+            surf.blit(ci, (x, CY + R + 18))
+            x += f_brand.size(ch)[0]
+
+    while True:
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if ev.type == pygame.KEYDOWN:
+                return
+        t = time.time() - t0
+        if t > TOTAL: return
+        draw_background(screen)
+        if t < 1.6:
+            p    = t / 1.6; ease = p * p * (3 - 2 * p)
+            draw_C(screen, ease)
+        elif t < 3.2:
+            pulse = 0.85 + 0.15 * math.sin(t * 7)
+            draw_C(screen, 1.0, pulse)
+            draw_brand(screen, (t - 1.6) / 1.6)
+        elif t < 4.6:
+            sub = (t - 3.2) / 1.4
+            draw_C(screen, 1.0, 0.9)
+            draw_brand(screen, 1.0)
+            fa = min(255, int(sub * 255))
+            ti = f_tag.render("KART DASHBOARD", True, GY2)
+            ti.set_alpha(fa)
+            screen.blit(ti, ti.get_rect(center=(CX, CY + R + 48)))
+        else:
+            fade_t = (t - 4.6) / 1.2
+            draw_C(screen, 1.0, 1.0 - fade_t)
+            draw_brand(screen, 1.0)
+            fade = pygame.Surface((W, H))
+            fade.fill(BG)
+            fade.set_alpha(int(fade_t * 255))
+            screen.blit(fade, (0, 0))
+        pygame.display.flip()
+        clock.tick(60)
+
+# ─── Main loop ────────────────────────────────────────────────────────────────
+SH_BTN = 36
+
+def main():
+    pygame.init()
+    screen = pygame.display.set_mode((W, H))
+    pygame.display.set_caption("Cosmos Builders — Kart Dashboard v16")
+    fonts = {
+        "big":  pygame.font.SysFont("dejavusans", 52, bold=True),
+        "head": pygame.font.SysFont("dejavusans", 18, bold=True),
+        "med":  pygame.font.SysFont("dejavusans", 14, bold=True),
+        "sm":   pygame.font.SysFont("dejavusans", 11),
+        "xs":   pygame.font.SysFont("dejavusans",  9),
+    }
+    run_startup(screen, fonts)
+    clock = pygame.time.Clock()
+
+    START_BTN = (4, H - 20 - SH_BTN,          192, SH_BTN)
+    RESET_BTN = (4, H - 20 - SH_BTN * 2 - 6,  192, SH_BTN)
+
+    while True:
+        # Reset-arm timeout
+        if ST["reset_armed"] and time.time() - ST["reset_arm_t"] > 8:
+            ST["reset_armed"]  = False
+            ST["confirm_msg"]  = "Reset cancelled"
+            ST["msg_t"]        = time.time()
+
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+
+            if ev.type == pygame.KEYDOWN:
+                k = ev.key
+                if   k == pygame.K_ESCAPE: pygame.quit(); sys.exit()
+                elif k == pygame.K_TAB:    ST["tab"] = (ST["tab"] + 1) % 4
+                elif k == pygame.K_SPACE:  toggle_start()
+                elif k == pygame.K_l:      toggle_lap()
+                elif k == pygame.K_n:      ST["night"] = not ST["night"]
+                elif k == pygame.K_e:      export_pdf()          # ← NEW
+                elif k == pygame.K_p:
+                    ST["pit_lane"] = not ST["pit_lane"]
+                    ST["confirm_msg"] = ("PIT LANE MODE ON"
+                                        if ST["pit_lane"] else "PIT LANE MODE OFF")
+                    ST["msg_t"] = time.time()
+                elif k == pygame.K_r:
+                    if ST["reset_armed"]:
+                        do_reset()
+                    else:
+                        ST["reset_armed"]  = True
+                        ST["reset_arm_t"]  = time.time()
+                        ST["confirm_msg"]  = "⚠ Press R again to confirm RESET!"
+                        ST["msg_t"]        = time.time()
+                elif k == pygame.K_1: ST["tab"] = 0
+                elif k == pygame.K_2: ST["tab"] = 1
+                elif k == pygame.K_3: ST["tab"] = 2
+                elif k == pygame.K_4: ST["tab"] = 3
+                elif k == pygame.K_UP and ST["tab"] == 3:
+                    ST["speed_limit"] = min(80, ST["speed_limit"] + 5)
+                elif k == pygame.K_DOWN and ST["tab"] == 3:
+                    ST["speed_limit"] = max(5,  ST["speed_limit"] - 5)
+
+            if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+                mx, my = ev.pos
+                # Tab bar click
+                if my < 32:
+                    ST["tab"] = min(mx // (W // 4), 3)
+                # Start button
+                sx, sy, sw, sh = START_BTN
+                if sx <= mx <= sx + sw and sy <= my <= sy + sh:
+                    toggle_start()
+                # Reset button
+                rx2, ry2, rw2, rh2 = RESET_BTN
+                if rx2 <= mx <= rx2 + rw2 and ry2 <= my <= ry2 + rh2:
+                    if ST["reset_armed"]:
+                        do_reset()
+                    else:
+                        ST["reset_armed"]  = True
+                        ST["reset_arm_t"]  = time.time()
+                        ST["confirm_msg"]  = "Click RESET again to confirm!"
+                        ST["msg_t"]        = time.time()
+                # Export button click (settings tab)
+                if ST["tab"] == 3:
+                    EX = 400; EY = 172; EW = 380
+                    BW, BH = 240, 38
+                    BX = EX + (EW - BW) // 2
+                    BY = EY + 36
+                    if BX <= mx <= BX + BW and BY <= my <= BY + BH:
+                        export_pdf()
+
+        demo_tick()
+        draw_background(screen)
+        tab = ST["tab"]
+        draw_header(screen, fonts, tab)
+        if   tab == 0: screen_drive(screen, fonts, START_BTN, RESET_BTN)
+        elif tab == 1: screen_telemetry(screen, fonts)
+        elif tab == 2: screen_gforce(screen, fonts)
+        elif tab == 3: screen_settings(screen, fonts, START_BTN, RESET_BTN)
+        draw_status(screen, fonts)
+        pygame.display.flip()
+        clock.tick(FPS)
+
+if __name__ == "__main__":
+    main()
